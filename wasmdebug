@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+wasmdebug -- host a .wat file so it can be stepped through in Chrome
+DevTools' built-in WebAssembly debugger.
+
+Usage:
+    wasmdebug path/to/file.wat [-p PORT] [--open]
+
+Requires `wat2wasm` on PATH (Ubuntu/Debian: `sudo apt install wabt`).
+
+How it works (see README.md for the full writeup of design decisions):
+  - This script compiles your .wat to .wasm itself, by shelling out to the
+    local `wat2wasm` binary each time /module.wasm is requested.
+  - The page fetches /module.wasm (once to inspect it, once via
+    WebAssembly.instantiateStreaming to actually instantiate it) and lists
+    the module's exported functions, with correctly-typed argument inputs,
+    so you can call them and hit your breakpoints.
+"""
+import argparse
+import html
+import http.server
+import shutil
+import socketserver
+import subprocess
+import sys
+import webbrowser
+from pathlib import Path
+
+PAGE_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>wasmdebug -- __WAT_FILENAME__</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.3rem; }
+  code, pre, input, .mono { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+  pre {
+    background: color-mix(in srgb, currentColor 6%, transparent);
+    padding: 0.75rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+  }
+  #status { padding: 0.5rem 0.75rem; border-radius: 6px; background: color-mix(in srgb, currentColor 8%, transparent); }
+  #status.error { background: #ffdddd; color: #900; }
+  .export-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0; flex-wrap: wrap; }
+  .export-row strong { min-width: 14rem; }
+  .export-row input { width: 6rem; padding: 0.2rem; }
+  .result { font-weight: bold; }
+  details summary { cursor: pointer; font-weight: bold; }
+  .hint { opacity: 0.75; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+
+<h1>wasmdebug: <span class="mono">__WAT_FILENAME__</span></h1>
+
+<div id="status">Starting...</div>
+
+<h2>Debug in Chrome DevTools</h2>
+<ol>
+  <li>Open DevTools (F12 / Cmd+Opt+I) and go to the <strong>Sources</strong> tab.</li>
+  <li>In the file tree, find this page's origin &rarr; <span class="mono">module.wasm</span>.
+      Chrome shows it as disassembled WebAssembly text -- this is what you set breakpoints in
+      (see the note below about why this isn't literally your .wat file).</li>
+  <li>Click a line number in that disassembly to set a breakpoint.</li>
+  <li>Click "Call" on one of the exported functions below to run the module. Execution will
+      pause at your breakpoint; step with the debugger controls and inspect locals in the
+      Scope pane.</li>
+</ol>
+<p class="hint">The live instance is also available from the DevTools Console as
+  <span class="mono">wasmdebugInstance</span>, e.g. <span class="mono">wasmdebugInstance.exports.run(3)</span>.</p>
+
+<h2>Exports</h2>
+<div id="exports"><em>Compiling...</em></div>
+
+<h2><details><summary>Original .wat source</summary>
+<pre id="source">(loading...)</pre>
+</details></h2>
+
+<script>
+"use strict";
+
+const VALTYPE = {0x7F:'i32', 0x7E:'i64', 0x7D:'f32', 0x7C:'f64', 0x7B:'v128', 0x70:'funcref', 0x6F:'externref'};
+const KIND_NAMES = {0:'func', 1:'table', 2:'memory', 3:'global'};
+
+// Minimal WebAssembly binary-format reader. We only need enough to find
+// each exported function's parameter/result types (to build the right
+// input boxes) and each imported function's shape (to auto-stub it) --
+// so this deliberately stops short of parsing the code section at all.
+function parseSections(bytes) {
+  let pos = 8; // skip \0asm + version
+  function u32() {
+    let result = 0, shift = 0, b;
+    do { b = bytes[pos++]; result |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return result >>> 0;
+  }
+  function byte() { return bytes[pos++]; }
+  function str() {
+    const len = u32();
+    const s = new TextDecoder().decode(bytes.subarray(pos, pos + len));
+    pos += len;
+    return s;
+  }
+  function limits() {
+    const flags = byte();
+    const min = u32();
+    const max = (flags & 1) ? u32() : null;
+    return { min, max };
+  }
+
+  const raw = {};
+  while (pos < bytes.length) {
+    const id = byte();
+    const size = u32();
+    raw[id] = { start: pos, end: pos + size };
+    pos = raw[id].end;
+  }
+
+  const types = [];
+  if (raw[1]) {
+    pos = raw[1].start;
+    const count = u32();
+    for (let i = 0; i < count; i++) {
+      byte(); // form, always 0x60 (func) for MVP types
+      const pc = u32(), params = [];
+      for (let j = 0; j < pc; j++) params.push(VALTYPE[byte()] || 'unknown');
+      const rc = u32(), results = [];
+      for (let j = 0; j < rc; j++) results.push(VALTYPE[byte()] || 'unknown');
+      types.push({ params, results });
+    }
+  }
+
+  const imports = [];
+  const importedFuncTypeIdx = [];
+  if (raw[2]) {
+    pos = raw[2].start;
+    const count = u32();
+    for (let i = 0; i < count; i++) {
+      const mod = str(), name = str(), kind = byte();
+      if (kind === 0) {
+        const typeIdx = u32();
+        importedFuncTypeIdx.push(typeIdx);
+        imports.push({ module: mod, name, kind, typeIdx });
+      } else if (kind === 1) {
+        const reftype = VALTYPE[byte()] || 'funcref';
+        imports.push({ module: mod, name, kind, reftype, limits: limits() });
+      } else if (kind === 2) {
+        imports.push({ module: mod, name, kind, limits: limits() });
+      } else if (kind === 3) {
+        const valtype = VALTYPE[byte()] || 'i32';
+        const mutable = !!byte();
+        imports.push({ module: mod, name, kind, valtype, mutable });
+      }
+    }
+  }
+
+  const localFuncTypeIdx = [];
+  if (raw[3]) {
+    pos = raw[3].start;
+    const count = u32();
+    for (let i = 0; i < count; i++) localFuncTypeIdx.push(u32());
+  }
+  const allFuncTypeIdx = importedFuncTypeIdx.concat(localFuncTypeIdx);
+
+  const exportsList = [];
+  if (raw[7]) {
+    pos = raw[7].start;
+    const count = u32();
+    for (let i = 0; i < count; i++) {
+      const name = str(), kind = byte(), index = u32();
+      const entry = { name, kind, index };
+      if (kind === 0) entry.signature = types[allFuncTypeIdx[index]] || { params: [], results: [] };
+      exportsList.push(entry);
+    }
+  }
+
+  return { types, imports, exports: exportsList, hasStart: !!raw[8] };
+}
+
+function defaultValueForType(vt) {
+  return vt === 'i64' ? 0n : 0;
+}
+
+// Modules that import functions (e.g. a "print" or "env" host API) can't
+// instantiate without something filling those imports. We don't know what
+// your host is supposed to do, so we stub every import: functions log
+// their call and return zeroed results, memories/tables/globals are
+// created with the shape the module asked for. Good enough to get you to
+// a breakpoint; not a real host environment.
+function buildImportStubs(sections) {
+  const importObject = {};
+  for (const imp of sections.imports) {
+    if (!importObject[imp.module]) importObject[imp.module] = {};
+    if (imp.kind === 0) {
+      const sig = sections.types[imp.typeIdx] || { params: [], results: [] };
+      importObject[imp.module][imp.name] = (...args) => {
+        console.log(`[wasmdebug] stubbed import ${imp.module}.${imp.name} called with`, args);
+        if (sig.results.length === 0) return undefined;
+        if (sig.results.length === 1) return defaultValueForType(sig.results[0]);
+        return sig.results.map(defaultValueForType);
+      };
+    } else if (imp.kind === 1) {
+      importObject[imp.module][imp.name] = new WebAssembly.Table({
+        element: imp.reftype === 'externref' ? 'externref' : 'anyfunc',
+        initial: imp.limits.min,
+        ...(imp.limits.max != null ? { maximum: imp.limits.max } : {}),
+      });
+    } else if (imp.kind === 2) {
+      importObject[imp.module][imp.name] = new WebAssembly.Memory({
+        initial: imp.limits.min,
+        ...(imp.limits.max != null ? { maximum: imp.limits.max } : {}),
+      });
+    } else if (imp.kind === 3) {
+      importObject[imp.module][imp.name] = new WebAssembly.Global(
+        { value: imp.valtype, mutable: imp.mutable },
+        defaultValueForType(imp.valtype)
+      );
+    }
+  }
+  return importObject;
+}
+
+function coerceArg(text, type) {
+  if (text.trim() === '') throw new Error('empty');
+  if (type === 'i64') return BigInt(text.trim());
+  const n = Number(text.trim());
+  if (Number.isNaN(n)) throw new Error('not a number');
+  return n;
+}
+
+function formatResult(ret) {
+  if (ret === undefined) return '(no return value)';
+  if (Array.isArray(ret)) return '[' + ret.map(String).join(', ') + ']';
+  return String(ret);
+}
+
+function renderExports(exportsList, instance) {
+  const container = document.getElementById('exports');
+  container.innerHTML = '';
+  const functionExports = exportsList.filter(e => e.kind === 0);
+  const otherExports = exportsList.filter(e => e.kind !== 0);
+
+  if (functionExports.length === 0) {
+    container.innerHTML = '<p><em>No exported functions to call from here -- use the DevTools ' +
+      'Console with <span class="mono">wasmdebugInstance</span> instead.</em></p>';
+  }
+
+  for (const exp of functionExports) {
+    const row = document.createElement('div');
+    row.className = 'export-row';
+
+    const label = document.createElement('strong');
+    label.className = 'mono';
+    label.textContent = `${exp.name}(${exp.signature.params.join(', ')})`;
+    row.appendChild(label);
+
+    const inputs = exp.signature.params.map((ptype) => {
+      const input = document.createElement('input');
+      input.placeholder = ptype;
+      input.dataset.type = ptype;
+      row.appendChild(input);
+      return input;
+    });
+
+    const button = document.createElement('button');
+    button.textContent = 'Call';
+    const resultEl = document.createElement('span');
+    resultEl.className = 'result mono';
+
+    button.onclick = () => {
+      let args;
+      try {
+        args = inputs.map((inp) => coerceArg(inp.value, inp.dataset.type));
+      } catch (e) {
+        resultEl.textContent = ' bad argument: ' + e.message;
+        return;
+      }
+      try {
+        const ret = instance.exports[exp.name](...args);
+        resultEl.textContent = ' -> ' + formatResult(ret);
+        console.log('[wasmdebug] called', exp.name, args, '=>', ret);
+      } catch (e) {
+        resultEl.textContent = ' trapped: ' + e.message;
+        console.error('[wasmdebug] call to', exp.name, 'threw:', e);
+      }
+    };
+
+    row.appendChild(button);
+    row.appendChild(resultEl);
+    container.appendChild(row);
+  }
+
+  if (otherExports.length > 0) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = 'Other exports (not callable here): ' +
+      otherExports.map(e => `${e.name} (${KIND_NAMES[e.kind]})`).join(', ');
+    container.appendChild(p);
+  }
+}
+
+async function main() {
+  const statusEl = document.getElementById('status');
+  const setStatus = (msg, isError = false) => {
+    statusEl.textContent = msg;
+    statusEl.className = isError ? 'error' : '';
+  };
+
+  setStatus('Fetching module.wat...');
+  try {
+    const res = await fetch('/module.wat');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    document.getElementById('source').textContent = await res.text();
+  } catch (e) {
+    setStatus('Failed to fetch module.wat: ' + e.message, true);
+    return;
+  }
+
+  setStatus('Compiling .wat to .wasm (via local wat2wasm)...');
+  let inspectBytes;
+  try {
+    const res = await fetch('/module.wasm');
+    if (!res.ok) throw new Error(await res.text());
+    inspectBytes = new Uint8Array(await res.arrayBuffer());
+  } catch (e) {
+    setStatus('Compile error: ' + e.message, true);
+    return;
+  }
+
+  const sections = parseSections(inspectBytes);
+  const importObject = buildImportStubs(sections);
+
+  setStatus('Instantiating...');
+  let instance, module;
+  try {
+    ({ instance, module } = await WebAssembly.instantiateStreaming(fetch('/module.wasm'), importObject));
+  } catch (e) {
+    setStatus('Instantiation/link error: ' + e.message, true);
+    return;
+  }
+
+  window.wasmdebugInstance = instance;
+  window.wasmdebugModule = module;
+
+  setStatus(sections.hasStart
+    ? 'Ready. (Module has a start function -- it already ran automatically on instantiation.)'
+    : 'Ready.');
+  renderExports(sections.exports, instance);
+}
+
+main();
+</script>
+</body>
+</html>
+"""
+
+
+def compile_wat(wat_path: Path):
+    """Compile wat_path to a wasm binary via the local wat2wasm. Returns
+    (wasm_bytes, stderr_text); wasm_bytes is None if compilation failed."""
+    proc = subprocess.run(
+        ["wat2wasm", str(wat_path), "--output=-", "--enable-all", "--debug-names"],
+        capture_output=True,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        return None, stderr_text
+    return proc.stdout, stderr_text
+
+
+def make_handler(wat_path: Path):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            sys.stderr.write("[wasmdebug] " + (fmt % args) + "\n")
+
+        def _send(self, code: int, body: bytes, content_type: str):
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                page = PAGE_TEMPLATE.replace("__WAT_FILENAME__", html.escape(wat_path.name))
+                self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+            elif self.path == "/module.wat":
+                self._send(200, wat_path.read_bytes(), "text/plain; charset=utf-8")
+            elif self.path == "/module.wasm":
+                wasm_bytes, err = compile_wat(wat_path)
+                if wasm_bytes is None:
+                    self._send(500, err.encode("utf-8"), "text/plain; charset=utf-8")
+                else:
+                    self._send(200, wasm_bytes, "application/wasm")
+            else:
+                self._send(404, b"not found", "text/plain")
+
+    return Handler
+
+
+class Server(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Serve a .wat file so it can be stepped through in Chrome DevTools."
+    )
+    parser.add_argument("wat_file", type=Path, help="Path to a .wat file")
+    parser.add_argument("-p", "--port", type=int, default=0, help="Port to listen on (default: pick a free port)")
+    parser.add_argument("--open", action="store_true", help="Also open the page in your default browser")
+    args = parser.parse_args()
+
+    if shutil.which("wat2wasm") is None:
+        print("error: wat2wasm not found on PATH.", file=sys.stderr)
+        print("Install it with: sudo apt install wabt", file=sys.stderr)
+        sys.exit(1)
+
+    wat_path = args.wat_file.expanduser().resolve()
+    if not wat_path.is_file():
+        print(f"error: no such file: {wat_path}", file=sys.stderr)
+        sys.exit(1)
+
+    handler = make_handler(wat_path)
+    with Server(("127.0.0.1", args.port), handler) as httpd:
+        host, port = httpd.server_address
+        url = f"http://{host}:{port}/"
+        print(f"Serving {wat_path.name} for debugging at:\n\n    {url}\n")
+        print('Open that URL in Chrome, then DevTools (F12) -> Sources tab. Ctrl+C to stop.\n')
+        if args.open:
+            webbrowser.open(url)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
